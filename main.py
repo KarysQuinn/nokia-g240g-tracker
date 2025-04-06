@@ -9,254 +9,260 @@ import time
 import json
 import logging
 import random
+from pathlib import Path
+from bs4 import BeautifulSoup
+from typing import List, Dict, Optional
 
 # 配置日志系统
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("modem_tracker.log"), logging.StreamHandler()],
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.FileHandler("modem_tracker.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
+class ConfigLoader:
+    """配置加载器"""
+    DEFAULT_CONFIG = {
+        "username": "admin",
+        "password": "FC5B3132",
+        "headless": False,
+        "base_url": "http://192.168.10.254",
+        "debug_dir": "debug",
+        "output_file": "device_report.json"
+    }
 
-class NokiaG240GDeviceTracker:
-    def __init__(self, headless=False):
-        self.options = Options()
-        if headless:
-            self.options.add_argument("--headless")
-        self.options.add_argument("--disable-gpu")
-        self.options.add_argument("--window-size=1920,1080")
-        self.options.add_argument("--disable-blink-features=AutomationControlled")
-        self.driver = None
-        self.base_url = "http://192.168.10.254"
-
-    def init_driver(self):
-        """初始化浏览器驱动"""
-        logging.info("初始化Edge浏览器...")
-        self.driver = webdriver.Edge(options=self.options)
-        self.driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                """
-            },
-        )
-
-    def human_like_input(self, element, text):
-        """模拟人类输入行为"""
-        element.clear()
-        for char in text:
-            element.send_keys(char)
-            time.sleep(random.uniform(0.05, 0.2))
-        time.sleep(0.3)
-
-    def login(self, username, password):
-        """执行登录流程"""
+    @classmethod
+    def load_config(cls, config_path: str = "config.json") -> dict:
+        """从文件加载配置"""
         try:
-            logging.info("导航到登录页面...")
-            self.driver.get(f"{self.base_url}/")
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                logger.info("成功加载配置文件")
+                return {**cls.DEFAULT_CONFIG, **config}
+        except FileNotFoundError:
+            logger.warning("配置文件未找到，使用默认配置")
+            return cls.DEFAULT_CONFIG
+        except json.JSONDecodeError:
+            logger.error("配置文件格式错误，使用默认配置")
+            return cls.DEFAULT_CONFIG
 
-            # 等待登录表单加载
-            form_locator = (By.CSS_SELECTOR, "form#loginform")
-            WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located(form_locator)
-            )
-
-            logging.info("输入登录凭据...")
-            username_field = self.driver.find_element(By.ID, "username")
-            password_field = self.driver.find_element(By.ID, "password")
-
-            self.human_like_input(username_field, username)
-            self.human_like_input(password_field, password)
-
-            # 提交表单
-            self.driver.find_element(By.ID, "loginBT").click()
-
-            # 验证登录成功
-            WebDriverWait(self.driver, 10).until(
-                lambda d: d.get_cookie("sid") is not None
-            )
-            logging.info("登录成功")
-            return True
-
-        except Exception as e:
-            logging.error(f"登录失败: {str(e)}", exc_info=True)
-            self._save_debug_info("login_failure")
-            return False
-
-    def get_device_list(self, html_file_path):
-        """从HTML文件解析设备列表"""
+class DeviceListParser:
+    """设备列表解析器"""
+    
+    @staticmethod
+    def parse_device_row(cols: list) -> Optional[Dict]:
+        """解析单个设备行"""
         try:
-            logging.info(f"解析HTML文件: {html_file_path}")
-            with open(html_file_path, "r", encoding="utf-8") as f:
-                html_content = f.read()
-
-            from bs4 import BeautifulSoup
-
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            # 定位设备列表表格
-            table = soup.find("tbody", {"id": "devicelist"})
-            if not table:
-                logging.error("未找到设备列表表格")
+            if len(cols) != 9:
+                logger.warning(f"无效的行数据，期望9列，实际{len(cols)}列")
                 return None
 
-            rows = table.find_all("tr")
-            logging.info(f"发现 {len(rows)} 个设备条目")
+            device = {
+                "status": cols[0].text.strip(),
+                "connection_type": cols[1].text.strip(),
+                "name": cols[2].text.strip() or "Unknown",
+                "ipv4": cols[3].text.strip(),
+                "mac": DeviceListParser._format_mac(cols[4].text),
+                "allocation": cols[5].text.strip(),
+                "lease": DeviceListParser._parse_lease_time(cols[6].text),
+                "last_active": DeviceListParser._parse_datetime(cols[7].text),
+            }
 
-            devices = []
-            for index, row in enumerate(rows):
-                try:
-                    cols = row.find_all("td")
-                    if len(cols) != 9:
-                        logging.warning(f"行 {index} 列数异常: {len(cols)}")
-                        continue
-
-                    device = self._parse_device_row_from_html(cols)
-                    devices.append(device)
-
-                except Exception as e:
-                    logging.warning(f"解析行 {index} 失败: {str(e)}")
-                    continue
-
-            return devices
+            device["is_active"] = device["status"].lower() == "active"
+            device["is_wireless"] = "wireless" in device["connection_type"].lower()
+            return device
 
         except Exception as e:
-            logging.error(f"解析HTML文件失败: {str(e)}", exc_info=True)
+            logger.error(f"解析设备行失败: {str(e)}")
             return None
 
-    def _parse_device_row_from_html(self, cols):
-        """从HTML列解析单个设备行"""
-        device = {
-            "status": cols[0].text.strip(),
-            "connection_type": cols[1].text.strip(),
-            "name": cols[2].text.strip() or "Unknown",
-            "ipv4": cols[3].text.strip(),
-            "mac": self._format_mac(cols[4].text),
-            "allocation": cols[5].text.strip(),
-            "lease": self._parse_lease_time(cols[6].text),
-            "last_active": self._parse_datetime(cols[7].text),
-        }
-
-        device["is_active"] = device["status"].lower() == "active"
-        device["is_wireless"] = "wireless" in device["connection_type"].lower()
-
-        return device
-
-    def _parse_device_row(self, cols):
-        """解析单个设备行"""
-        # 基础字段解析
-        device = {
-            "status": cols[0].text.strip(),
-            "connection_type": cols[1].text.strip(),
-            "name": cols[2].text.strip() or "Unknown",
-            "ipv4": cols[3].text.strip(),
-            "mac": self._format_mac(cols[4].text),
-            "allocation": cols[5].text.strip(),
-            "lease": self._parse_lease_time(cols[6].text),
-            "last_active": self._parse_datetime(cols[7].text),
-        }
-
-        # 附加处理
-        device["is_active"] = device["status"].lower() == "active"
-        device["is_wireless"] = "wireless" in device["connection_type"].lower()
-
-        return device
-
-    def _format_mac(self, raw_mac):
+    @staticmethod
+    def _format_mac(raw_mac: str) -> str:
         """统一MAC地址格式"""
-        mac = raw_mac.strip().upper()
-        mac = re.sub(r"[^A-F0-9]", "", mac)  # 移除非十六进制字符
-        return (
-            ":".join(mac[i : i + 2] for i in range(0, 12, 2))
-            if len(mac) == 12
-            else raw_mac
-        )
+        mac = re.sub(r"[^A-F0-9]", "", raw_mac.strip().upper())
+        return ":".join(mac[i:i+2] for i in range(0, 12, 2)) if len(mac) == 12 else raw_mac
 
-    def _parse_lease_time(self, lease_str):
+    @staticmethod
+    def _parse_lease_time(lease_str: str) -> int:
         """将租约时间转为秒数"""
-        try:
-            time_map = {"hour": 3600, "min": 60, "sec": 1}
-            total = 0
-            for match in re.finditer(r"(\d+)\s*(hour|min|sec)", lease_str):
-                value, unit = match.groups()
-                total += int(value) * time_map[unit.lower()]
-            return total
-        except:
-            return lease_str.strip()
+        time_map = {"hour": 3600, "min": 60, "sec": 1}
+        total = 0
+        for match in re.finditer(r"(\d+)\s*(hour|min|sec)", lease_str.lower()):
+            total += int(match.group(1)) * time_map[match.group(2)]
+        return total if total > 0 else lease_str.strip()
 
-    def _parse_datetime(self, dt_str):
+    @staticmethod
+    def _parse_datetime(dt_str: str) -> str:
         """解析最后活动时间"""
         try:
             return datetime.strptime(dt_str, "%m/%d/%Y %I:%M:%S %p").isoformat()
         except ValueError:
             return dt_str.strip()
 
-    def _save_debug_info(self, scenario):
-        """保存调试信息"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+class NokiaG240GDeviceTracker:
+    def __init__(self, config: dict):
+        self.config = config
+        self.driver = None
+        self._init_browser_options()
+
+    def _init_browser_options(self):
+        """初始化浏览器选项"""
+        self.options = Options()
+        if self.config["headless"]:
+            self.options.add_argument("--headless")
+        self.options.add_argument("--disable-gpu")
+        self.options.add_argument("--window-size=1920,1080")
+        self.options.add_argument("--disable-blink-features=AutomationControlled")
+        self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+    def init_driver(self):
+        """初始化浏览器驱动"""
+        logger.info("初始化Edge浏览器...")
+        self.driver = webdriver.Edge(options=self.options)
+        self._hide_automation_flags()
+
+    def _hide_automation_flags(self):
+        """隐藏自动化特征"""
+        self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined})
+                """
+            }
+        )
+
+    def human_like_input(self, element, text: str):
+        """模拟人类输入行为"""
+        element.clear()
+        for char in text:
+            element.send_keys(char)
+            time.sleep(random.uniform(0.03, 0.15))
+        time.sleep(random.uniform(0.1, 0.3))  # 输入后随机等待
+
+    def login(self) -> bool:
+        """执行登录流程"""
         try:
-            # 保存截图
-            self.driver.save_screenshot(f"debug/{scenario}_{timestamp}.png")
-            # 保存页面源码
-            with open(f"debug/{scenario}_{timestamp}.html", "w", encoding="utf-8") as f:
+            logger.info("导航到登录页面...")
+            self.driver.get(f"{self.config['base_url']}/")
+
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "form#loginform"))
+            )
+
+            logger.info("输入登录凭据...")
+            username_field = self.driver.find_element(By.ID, "username")
+            password_field = self.driver.find_element(By.ID, "password")
+
+            self.human_like_input(username_field, self.config["username"])
+            self.human_like_input(password_field, self.config["password"])
+
+            self.driver.find_element(By.ID, "loginBT").click()
+
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.get_cookie("sid") is not None
+            )
+            logger.info("登录成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"登录失败: {str(e)}", exc_info=True)
+            self._save_debug_info("login_failure")
+            return False
+
+    def get_device_list(self, html_file_path: str) -> Optional[List[Dict]]:
+        """从HTML文件解析设备列表"""
+        try:
+            logger.info(f"解析HTML文件: {html_file_path}")
+            with open(html_file_path, "r", encoding="utf-8") as f:
+                soup = BeautifulSoup(f.read(), "html.parser")
+
+            table = soup.find("tbody", {"id": "devicelist"})
+            if not table:
+                logger.error("未找到设备列表表格")
+                return None
+
+            devices = []
+            for row_idx, row in enumerate(table.find_all("tr")):
+                cols = row.find_all("td")
+                if device := DeviceListParser.parse_device_row(cols):
+                    devices.append(device)
+                else:
+                    logger.warning(f"行 {row_idx} 解析失败")
+
+            logger.info(f"成功解析 {len(devices)} 个设备")
+            return devices
+
+        except Exception as e:
+            logger.error(f"解析HTML文件失败: {str(e)}", exc_info=True)
+            self._save_debug_info("parse_failure")
+            return None
+
+    def _save_debug_info(self, scenario: str):
+        """保存调试信息"""
+        try:
+            debug_dir = Path(self.config["debug_dir"])
+            debug_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.driver.save_screenshot(debug_dir / f"{scenario}_{timestamp}.png")
+            
+            with open(debug_dir / f"{scenario}_{timestamp}.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
         except Exception as e:
-            logging.error(f"保存调试信息失败: {str(e)}")
+            logger.error(f"保存调试信息失败: {str(e)}")
 
     def close(self):
         """关闭浏览器"""
         if self.driver:
             self.driver.quit()
-            logging.info("浏览器已关闭")
+            logger.info("浏览器已关闭")
 
+class ReportGenerator:
+    """报告生成器"""
+    
+    @staticmethod
+    def print_summary(devices: List[Dict]):
+        """打印摘要信息"""
+        print("\n设备列表摘要：")
+        print("-" * 90)
+        print(f"{'状态':<8}{'设备名称':<20}{'IP地址':<15}{'MAC地址':<20}{'最后活动时间':<25}")
+        print("-" * 90)
+        for device in devices:
+            print(
+                f"{device['status']:<8}"
+                f"{device['name']:<20}"
+                f"{device['ipv4']:<15}"
+                f"{device['mac']:<20}"
+                f"{device['last_active']:<25}"
+            )
+
+    @staticmethod
+    def save_report(devices: List[Dict], filename: str):
+        """保存完整报告"""
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(devices, f, indent=2, ensure_ascii=False)
+        logger.info(f"完整报告已保存至 {filename}")
 
 def main():
-    # 配置参数
-    config = {"username": "admin", "password": "FC5B3132", "headless": False}
-    html_file_path = "debug/device_list_failure_20250406_160431.html"
-
-    # 初始化跟踪器
-    tracker = NokiaG240GDeviceTracker(headless=config["headless"])
+    config = ConfigLoader.load_config()
+    tracker = NokiaG240GDeviceTracker(config)
+    
     try:
         tracker.init_driver()
-
-        if tracker.login(config["username"], config["password"]):
-            # 从HTML文件获取设备列表
-            devices = tracker.get_device_list(html_file_path)
-            if devices:
-                # 打印摘要信息
-                print("\n设备列表摘要：")
-                print("-" * 120)
-                print(
-                    f"{'状态':<8}{'设备名称':<20}{'IP地址':<15}{'MAC地址':<20}{'最后活动时间':<25}"
-                )
-                print("-" * 120)
-                for device in devices:
-                    print(
-                        f"{device['status']:<8}"
-                        f"{device['name']:<20}"
-                        f"{device['ipv4']:<15}"
-                        f"{device['mac']:<20}"
-                        f"{device['last_active']:<25}"
-                    )
-
-                # 保存完整报告
-                with open("device_report.json", "w", encoding="utf-8") as f:
-                    json.dump(devices, f, indent=2, ensure_ascii=False)
-                logging.info("完整报告已保存至 device_report.json")
+        if tracker.login():
+            if devices := tracker.get_device_list("debug/device_list_sample.html"):
+                ReportGenerator.print_summary(devices)
+                ReportGenerator.save_report(devices, config["output_file"])
             else:
-                logging.warning("未获取到有效设备数据")
-        else:
-            logging.error("登录失败，请检查日志")
-
+                logger.warning("未获取到有效设备数据")
     except Exception as e:
-        logging.critical(f"主流程异常: {str(e)}", exc_info=True)
+        logger.critical(f"主流程异常: {str(e)}", exc_info=True)
     finally:
         tracker.close()
-
 
 if __name__ == "__main__":
     main()
